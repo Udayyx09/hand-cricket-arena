@@ -82,7 +82,7 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
             // Host initiates WebRTC offer when guest joins
             if (isRoomHost && state.playerTwoId && !offerSentRef.current) {
               offerSentRef.current = true;
-              pc.createOffer()
+              pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true })
                 .then((offer) => pc.setLocalDescription(offer))
                 .then(() => {
                   client.publish({
@@ -126,7 +126,7 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
               while (iceCandidateQueue.current.length > 0) {
                 await pc.addIceCandidate(iceCandidateQueue.current.shift());
               }
-              const answer = await pc.createAnswer();
+              const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
               await pc.setLocalDescription(answer);
               client.publish({
                 destination: `/app/room/${room}/signal`,

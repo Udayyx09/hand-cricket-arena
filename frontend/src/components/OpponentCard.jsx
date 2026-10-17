@@ -25,6 +25,7 @@ export default function OpponentCard({
   useEffect(() => {
     if (remoteVideoRef.current && remoteStream) {
       remoteVideoRef.current.srcObject = remoteStream;
+      remoteVideoRef.current.muted = false;
       remoteVideoRef.current.play().catch(e => console.warn("Remote video auto-play prevented:", e));
     }
   }, [remoteStream]);
@@ -54,6 +55,7 @@ export default function OpponentCard({
               ref={remoteVideoRef}
               autoPlay
               playsInline
+              muted={false}
               className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
             />
           ) : !isBot && (

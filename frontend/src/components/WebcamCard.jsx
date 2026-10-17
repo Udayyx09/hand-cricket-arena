@@ -39,10 +39,12 @@ export default function WebcamCard({
   currentGesture,     // { number, label, emoji }
   setCurrentGesture,
   latestGestureRef,   // ref to store latest smoothed gesture for 0-latency lock-in
-  onStreamReady       // callback passing local MediaStream for WebRTC
+  onStreamReady,      // callback passing local MediaStream for WebRTC
+  micEnabled = true   // microphone state
 }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const streamRef = useRef(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(null);
   const [landmarkerReady, setLandmarkerReady] = useState(false);
@@ -65,20 +67,54 @@ export default function WebcamCard({
     };
   }, []);
 
-  // Initialize Webcam Stream
+  // Sync micEnabled to audio tracks
+  useEffect(() => {
+    if (streamRef.current) {
+      streamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = micEnabled;
+      });
+    }
+  }, [micEnabled]);
+
+  // Initialize Webcam & Microphone Stream
   useEffect(() => {
     let stream = null;
 
     async function startCamera() {
       try {
         setCameraError(null);
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 640 },
-            height: { ideal: 640 },
-            facingMode: 'user'
-          },
-          audio: false
+        try {
+          // 1. Request both Camera and Microphone with Echo Cancellation
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 640 },
+              facingMode: 'user'
+            },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+        } catch (audioErr) {
+          console.warn("Microphone access failed or denied, falling back to video only:", audioErr);
+          // 2. Graceful fallback to video only
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 640 },
+              facingMode: 'user'
+            },
+            audio: false
+          });
+        }
+
+        streamRef.current = stream;
+
+        // Apply initial mic state
+        stream.getAudioTracks().forEach(track => {
+          track.enabled = micEnabled;
         });
 
         if (videoRef.current) {

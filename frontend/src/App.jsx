@@ -15,6 +15,21 @@ export default function App() {
   const [currentView, setCurrentView] = useState('LOBBY'); // 'LOBBY' | 'ARENA'
   const [gameMode, setGameMode] = useState('BOT');         // 'BOT' | 'MULTIPLAYER'
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [micEnabled, setMicEnabled] = useState(true);
+  const localStreamRef = useRef(null);
+
+  const handleToggleMic = () => {
+    setMicEnabled(prev => {
+      const next = !prev;
+      if (localStreamRef.current) {
+        localStreamRef.current.getAudioTracks().forEach(track => {
+          track.enabled = next;
+        });
+      }
+      playSound('click', soundEnabledRef.current);
+      return next;
+    });
+  };
 
   // Bot Mode: Rivalry record in localStorage
   const [botRivalryRecord, setBotRivalryRecord] = useState(() => {
@@ -490,6 +505,8 @@ export default function App() {
         playerId={multiplayer.myPlayerId}
         currentView={currentView}
         onExitToLobby={handleExitToLobby}
+        micEnabled={micEnabled}
+        onToggleMic={handleToggleMic}
       />
 
       {/* Main Container */}
@@ -531,7 +548,9 @@ export default function App() {
                 currentGesture={currentGesture}
                 setCurrentGesture={setCurrentGesture}
                 latestGestureRef={latestGestureRef}
+                micEnabled={micEnabled}
                 onStreamReady={(stream) => {
+                  localStreamRef.current = stream;
                   if (gameMode === 'MULTIPLAYER') {
                     multiplayer.setLocalStream(stream);
                   }
