@@ -12,12 +12,12 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void registerStompEndpoints(StompEndpointRegistry registry) {
-        // Native WebSocket STOMP endpoint
-        registry.addEndpoint("/ws-cricket")
+        // Native WebSocket STOMP endpoints (support both /ws and /ws-cricket)
+        registry.addEndpoint("/ws", "/ws-cricket")
                 .setAllowedOriginPatterns("*");
 
-        // SockJS fallback STOMP endpoint
-        registry.addEndpoint("/ws-cricket")
+        // SockJS fallback STOMP endpoints
+        registry.addEndpoint("/ws", "/ws-cricket")
                 .setAllowedOriginPatterns("*")
                 .withSockJS();
     }
