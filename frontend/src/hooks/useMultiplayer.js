@@ -6,7 +6,14 @@ const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || 'http://localhost:8080'
 const BACKEND_HTTP = BACKEND_URL;
 const BACKEND_WS = `${BACKEND_URL}/ws-cricket`;
 
-export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved, onInningsBreak, onMatchOver }) {
+export function useMultiplayer({ 
+  onCountdownTick, 
+  onThrowTrigger, 
+  onBallResolved, 
+  onInningsBreak, 
+  onMatchOver,
+  remoteVideoRef: externalRemoteVideoRef
+} = {}) {
   const [roomCode, setRoomCode] = useState(null);
   const [myPlayerId, setMyPlayerId] = useState(null);
   const [isHost, setIsHost] = useState(false);
@@ -19,14 +26,20 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
   const iceCandidateQueue = useRef([]);
+  const localIceQueue = useRef([]);
   const offerSentRef = useRef(false);
+  const internalRemoteVideoRef = useRef(null);
+  const remoteVideoRef = externalRemoteVideoRef || internalRemoteVideoRef;
 
   // Initialize or return RTCPeerConnection
   const getOrCreatePeerConnection = useCallback((room, myId) => {
     if (peerConnectionRef.current) return peerConnectionRef.current;
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     });
 
     // Add local tracks if available
@@ -37,27 +50,38 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
     }
 
     pc.onicecandidate = (event) => {
-      if (event.candidate && stompClientRef.current?.connected && room) {
-        stompClientRef.current.publish({
-          destination: `/app/room/${room}/signal`,
-          body: JSON.stringify({
-            senderId: myId,
-            type: 'ice-candidate',
-            data: event.candidate
-          })
-        });
+      if (event.candidate && room) {
+        const payload = {
+          senderId: myId,
+          type: 'ice-candidate',
+          data: event.candidate
+        };
+        if (stompClientRef.current?.connected) {
+          stompClientRef.current.publish({
+            destination: `/app/room/${room}/signal`,
+            body: JSON.stringify(payload)
+          });
+        } else {
+          localIceQueue.current.push(payload);
+        }
       }
     };
 
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        setRemoteStream(event.streams[0]);
+      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+      setRemoteStream(incomingStream);
+
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = (event.streams && event.streams[0]) ? event.streams[0] : incomingStream;
+        remoteVideoRef.current.play().catch((err) => {
+          console.warn("Remote video auto-play prevented:", err);
+        });
       }
     };
 
     peerConnectionRef.current = pc;
     return pc;
-  }, []);
+  }, [remoteVideoRef]);
 
   // Connect STOMP WebSocket
   const connectStomp = useCallback((room, playerId, isRoomHost) => {
@@ -73,6 +97,52 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
         setConnectionStatus('CONNECTED');
         const pc = getOrCreatePeerConnection(room, playerId);
 
+        // Send offer helper
+        const sendOffer = () => {
+          if (!pc || !client.connected) return;
+          if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((track) => {
+              const senders = pc.getSenders();
+              if (!senders.some((s) => s.track === track)) {
+                pc.addTrack(track, localStreamRef.current);
+              }
+            });
+          }
+          pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true })
+            .then((offer) => pc.setLocalDescription(offer))
+            .then(() => {
+              client.publish({
+                destination: `/app/room/${room}/signal`,
+                body: JSON.stringify({
+                  senderId: playerId,
+                  type: 'offer',
+                  data: pc.localDescription
+                })
+              });
+            })
+            .catch((err) => console.warn("Error creating offer:", err));
+        };
+
+        // Flush any queued local ICE candidates
+        while (localIceQueue.current.length > 0) {
+          const payload = localIceQueue.current.shift();
+          client.publish({
+            destination: `/app/room/${room}/signal`,
+            body: JSON.stringify(payload)
+          });
+        }
+
+        // If guest, announce readiness to host
+        if (!isRoomHost) {
+          client.publish({
+            destination: `/app/room/${room}/signal`,
+            body: JSON.stringify({
+              senderId: playerId,
+              type: 'ready'
+            })
+          });
+        }
+
         // 1. Subscribe to Game State topic
         client.subscribe(`/topic/room/${room}/state`, (message) => {
           try {
@@ -82,19 +152,7 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
             // Host initiates WebRTC offer when guest joins
             if (isRoomHost && state.playerTwoId && !offerSentRef.current) {
               offerSentRef.current = true;
-              pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true })
-                .then((offer) => pc.setLocalDescription(offer))
-                .then(() => {
-                  client.publish({
-                    destination: `/app/room/${room}/signal`,
-                    body: JSON.stringify({
-                      senderId: playerId,
-                      type: 'offer',
-                      data: pc.localDescription
-                    })
-                  });
-                })
-                .catch((err) => console.warn("Error creating offer:", err));
+              sendOffer();
             }
 
             // Sync countdown and ball resolution events
@@ -121,10 +179,27 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
             const signal = JSON.parse(message.body);
             if (signal.senderId === playerId) return; // Ignore own echoes
 
-            if (signal.type === 'offer') {
+            if (signal.type === 'ready') {
+              if (isRoomHost) {
+                sendOffer();
+              }
+            } else if (signal.type === 'offer') {
+              if (localStreamRef.current) {
+                localStreamRef.current.getTracks().forEach((track) => {
+                  const senders = pc.getSenders();
+                  if (!senders.some((s) => s.track === track)) {
+                    pc.addTrack(track, localStreamRef.current);
+                  }
+                });
+              }
               await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
               while (iceCandidateQueue.current.length > 0) {
-                await pc.addIceCandidate(iceCandidateQueue.current.shift());
+                const queued = iceCandidateQueue.current.shift();
+                try {
+                  await pc.addIceCandidate(queued);
+                } catch (e) {
+                  console.warn("Error adding queued ICE candidate:", e);
+                }
               }
               const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
               await pc.setLocalDescription(answer);
@@ -139,14 +214,23 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
             } else if (signal.type === 'answer') {
               await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
               while (iceCandidateQueue.current.length > 0) {
-                await pc.addIceCandidate(iceCandidateQueue.current.shift());
+                const queued = iceCandidateQueue.current.shift();
+                try {
+                  await pc.addIceCandidate(queued);
+                } catch (e) {
+                  console.warn("Error adding queued ICE candidate:", e);
+                }
               }
             } else if (signal.type === 'ice-candidate') {
-              const candidate = new RTCIceCandidate(signal.data);
-              if (pc.remoteDescription && pc.remoteDescription.type) {
-                await pc.addIceCandidate(candidate);
-              } else {
-                iceCandidateQueue.current.push(candidate);
+              try {
+                const candidate = new RTCIceCandidate(signal.data);
+                if (pc.remoteDescription && pc.remoteDescription.type) {
+                  await pc.addIceCandidate(candidate);
+                } else {
+                  iceCandidateQueue.current.push(candidate);
+                }
+              } catch (err) {
+                console.warn("Error adding ICE candidate:", err);
               }
             }
           } catch (e) {
@@ -275,6 +359,9 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
     setRemoteStream(null);
     setServerState(null);
     setRoomCode(null);
@@ -284,6 +371,7 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
     setErrorMessage(null);
     offerSentRef.current = false;
     iceCandidateQueue.current = [];
+    localIceQueue.current = [];
   };
 
   useEffect(() => {
@@ -299,6 +387,7 @@ export function useMultiplayer({ onCountdownTick, onThrowTrigger, onBallResolved
     isHost,
     serverState,
     remoteStream,
+    remoteVideoRef,
     connectionStatus,
     errorMessage,
     createRoom,

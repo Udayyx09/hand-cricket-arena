@@ -565,6 +565,7 @@ export default function App() {
                 isBot={gameMode === 'BOT'}
                 lastOutcome={lastBallResult?.isOut ? 'OUT' : 'RUNS'}
                 remoteStream={gameMode === 'MULTIPLAYER' ? multiplayer.remoteStream : null}
+                remoteVideoRef={multiplayer.remoteVideoRef}
               />
             </div>
 

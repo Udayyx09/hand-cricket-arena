@@ -1,5 +1,5 @@
 import React, { useRef, useEffect } from 'react';
-import { Bot, User, Video, VideoOff } from 'lucide-react';
+import { Bot, User, Video } from 'lucide-react';
 
 const gestureEmojiMap = {
   1: '☝️',
@@ -16,19 +16,22 @@ export default function OpponentCard({
   opponentMove,       // 1 to 6, or null
   isBot = true,
   lastOutcome,        // e.g. 'RUNS', 'OUT', null
-  remoteStream = null // incoming WebRTC stream
+  remoteStream = null, // incoming WebRTC stream
+  remoteVideoRef = null
 }) {
-  const remoteVideoRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const activeVideoRef = remoteVideoRef || localVideoRef;
   const isSightScreenUp = countdown !== null && countdown > 0;
 
   // Attach remote stream to video element
   useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
-      remoteVideoRef.current.muted = false;
-      remoteVideoRef.current.play().catch(e => console.warn("Remote video auto-play prevented:", e));
+    if (activeVideoRef.current && remoteStream) {
+      if (activeVideoRef.current.srcObject !== remoteStream) {
+        activeVideoRef.current.srcObject = remoteStream;
+      }
+      activeVideoRef.current.play().catch(e => console.warn("Remote video auto-play prevented:", e));
     }
-  }, [remoteStream]);
+  }, [remoteStream, activeVideoRef]);
 
   return (
     <div className="flex-1 flex flex-col items-center">
@@ -49,31 +52,62 @@ export default function OpponentCard({
 
         {/* Aspect Square Card Area */}
         <div className="relative aspect-square w-full bg-[#1e1e1e] overflow-hidden flex items-center justify-center select-none">
-          {/* 1. Live Remote Video Stream (if in multiplayer mode) */}
-          {!isBot && remoteStream ? (
+          {/* 1. Live Remote Video Stream (Multiplayer) - Always rendered so ref is ready immediately */}
+          {!isBot && (
             <video
-              ref={remoteVideoRef}
+              ref={activeVideoRef}
               autoPlay
               playsInline
-              muted={false}
-              className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
+              muted
+              className={`absolute inset-0 w-full h-full object-cover scale-x-[-1] transition-opacity duration-300 ${
+                remoteStream ? 'opacity-100 z-10' : 'opacity-0 pointer-events-none'
+              }`}
             />
-          ) : !isBot && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-gray-400 bg-[#161616]">
+          )}
+
+          {/* Voice Chat Audio: Plays incoming audio while video element stays muted for autoplay compliance */}
+          {!isBot && remoteStream && (
+            <audio
+              autoPlay
+              playsInline
+              ref={(audioEl) => {
+                if (audioEl && audioEl.srcObject !== remoteStream) {
+                  audioEl.srcObject = remoteStream;
+                  audioEl.play().catch(e => console.warn("Remote voice auto-play prevented:", e));
+                }
+              }}
+            />
+          )}
+
+          {/* Placeholder card: ONLY shown when waiting for friend's stream, never covers connected video */}
+          {!isBot && !remoteStream && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-gray-400 bg-[#161616] z-0">
               <Video size={44} className="text-[#ff66c4] mb-2 animate-pulse" />
               <p className="font-black text-xs sm:text-sm text-gray-200 uppercase tracking-wider">
                 FRIEND CONNECTED
               </p>
               <p className="text-[11px] text-gray-500 mt-1">
-                Video syncs on throw
+                Connecting P2P WebRTC video stream...
+              </p>
+            </div>
+          )}
+
+          {/* Bot Card Placeholder when in bot mode */}
+          {isBot && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-gray-400 bg-[#161616] z-0">
+              <div className="w-20 h-20 rounded-full bg-[#111] border-4 border-black flex items-center justify-center mb-2">
+                <Bot size={44} className="text-[#ff66c4] animate-pulse" />
+              </div>
+              <p className="font-black text-xs text-gray-300 tracking-wider uppercase">
+                READY FOR NEXT BALL
               </p>
             </div>
           )}
 
           {/* 2. Revealed Move Content Overlay (Under the Sightscreen) */}
-          <div className={`absolute inset-0 flex flex-col items-center justify-center p-4 text-center z-10 transition-opacity duration-300 ${isSightScreenUp ? 'opacity-0' : 'opacity-100'}`}>
+          <div className={`absolute inset-0 flex flex-col items-center justify-center p-4 text-center z-10 transition-opacity duration-300 ${isSightScreenUp ? 'opacity-0 pointer-events-none' : 'opacity-100 pointer-events-none'}`}>
             {opponentMove ? (
-              <div className="flex flex-col items-center animate-brutal-pulse bg-black/75 p-4 rounded-2xl border-2 border-white/30 backdrop-blur-sm">
+              <div className="flex flex-col items-center animate-brutal-pulse bg-black/75 p-4 rounded-2xl border-2 border-white/30 backdrop-blur-sm pointer-events-auto">
                 <div className="text-6xl sm:text-7xl mb-1 drop-shadow-[4px_4px_0px_#000]">
                   {gestureEmojiMap[opponentMove] || '✊'}
                 </div>
@@ -84,20 +118,11 @@ export default function OpponentCard({
                   {!playerIsBatting ? `Scoring ${opponentMove} runs!` : `Bowling ${opponentMove}!`}
                 </p>
               </div>
-            ) : isBot ? (
-              <div className="flex flex-col items-center text-gray-400">
-                <div className="w-20 h-20 rounded-full bg-[#111] border-4 border-black flex items-center justify-center mb-2">
-                  <Bot size={44} className="text-[#ff66c4] animate-pulse" />
-                </div>
-                <p className="font-black text-xs text-gray-300 tracking-wider uppercase">
-                  READY FOR NEXT BALL
-                </p>
-              </div>
             ) : null}
           </div>
 
           {/* 3. Lined-paper SIGHTSCREEN Overlay */}
-          {/* Covers the card completely during countdown (3, 2, 1) */}
+          {/* Covers the card during countdown (3, 2, 1) */}
           <div
             className={`absolute inset-0 z-20 sightscreen-paper border-b-4 border-black flex flex-col items-center justify-between p-6 transition-all duration-300 ease-in-out ${
               isSightScreenUp
