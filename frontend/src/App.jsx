@@ -84,6 +84,11 @@ export default function App() {
 
   // Multiplayer Hook Callbacks
   const handleMultiplayerCountdownTick = (count) => {
+    if (count === 3) {
+      setLockedPlayerMove(null);
+      setOpponentMove(null);
+      setLastBallResult(null);
+    }
     if (count > 0) {
       playSound('tick', soundEnabledRef.current);
     }
@@ -101,6 +106,7 @@ export default function App() {
       pMove = Math.floor(Math.random() * 4) + 1;
     }
 
+    // Freeze locked move immediately on local client
     setLockedPlayerMove(pMove);
     manualOverrideRef.current = null;
     setManualOverrideMove(null);
@@ -110,17 +116,25 @@ export default function App() {
   };
 
   const handleMultiplayerBallResolved = (state) => {
-    const isP1 = multiplayer.isHost;
-    const oppMove = isP1 ? state.playerTwoLastMove : state.playerOneLastMove;
-    const myMove = isP1 ? state.playerOneLastMove : state.playerTwoLastMove;
+    const isP1 = (multiplayer.myPlayerId === state.playerOneId);
+    const amIBatting = (state.batterId === multiplayer.myPlayerId);
 
-    setLockedPlayerMove(myMove);
-    setOpponentMove(oppMove);
+    // Exact moves from server payload
+    let myFinalMove = isP1 ? state.playerOneLastMove : state.playerTwoLastMove;
+    let oppFinalMove = isP1 ? state.playerTwoLastMove : state.playerOneLastMove;
+
+    if (state.lastBallOutcome) {
+      myFinalMove = amIBatting ? state.lastBallOutcome.batterMove : state.lastBallOutcome.bowlerMove;
+      oppFinalMove = amIBatting ? state.lastBallOutcome.bowlerMove : state.lastBallOutcome.batterMove;
+    }
+
+    setLockedPlayerMove(myFinalMove);
+    setOpponentMove(oppFinalMove);
 
     if (state.lastBallOutcome) {
       setLastBallResult({
-        playerMove: myMove,
-        botMove: oppMove,
+        playerMove: myFinalMove,
+        botMove: oppFinalMove,
         runs: state.lastBallOutcome.runsScored,
         isOut: state.lastBallOutcome.isOut,
         text: state.lastBallOutcome.outcomeMessage

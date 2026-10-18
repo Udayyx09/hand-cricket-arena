@@ -164,8 +164,10 @@ export function useMultiplayer({
             } else if (state.eventType === 'BALL_RESULT') {
               if (onBallResolved) onBallResolved(state);
             } else if (state.eventType === 'INNINGS_BREAK') {
+              if (onBallResolved) onBallResolved(state);
               if (onInningsBreak) onInningsBreak(state);
             } else if (state.eventType === 'MATCH_OVER') {
+              if (onBallResolved) onBallResolved(state);
               if (onMatchOver) onMatchOver(state);
             }
           } catch (e) {

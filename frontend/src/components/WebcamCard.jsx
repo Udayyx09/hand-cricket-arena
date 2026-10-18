@@ -50,6 +50,8 @@ export default function WebcamCard({
   const [landmarkerReady, setLandmarkerReady] = useState(false);
   const animationFrameId = useRef(null);
   const gestureBufferRef = useRef([]);
+  const lockedPlayerMoveRef = useRef(lockedPlayerMove);
+  lockedPlayerMoveRef.current = lockedPlayerMove;
 
   // Initialize MediaPipe HandLandmarker
   useEffect(() => {
@@ -151,6 +153,12 @@ export default function WebcamCard({
 
     async function detectLoop() {
       if (!isDetecting) return;
+
+      // Freeze detection if move has been locked for this ball so it doesn't overwrite
+      if (lockedPlayerMoveRef.current !== null) {
+        animationFrameId.current = requestAnimationFrame(detectLoop);
+        return;
+      }
 
       const video = videoRef.current;
       const canvas = canvasRef.current;
@@ -311,9 +319,15 @@ export default function WebcamCard({
           {/* Live Gesture Detection Dark Badge (Top-Left) */}
           <div className="absolute top-3 left-3 z-10">
             <div className="bg-black/90 text-white font-black text-xs sm:text-sm px-3 py-1.5 rounded-lg border-2 border-white/40 shadow-[2px_2px_0px_#000] flex items-center gap-2 backdrop-blur-sm">
-              <span className="text-base sm:text-lg">{currentGesture?.emoji || '❓'}</span>
+              <span className="text-base sm:text-lg">
+                {lockedPlayerMove !== null && gestureMeta[lockedPlayerMove]
+                  ? gestureMeta[lockedPlayerMove].emoji
+                  : (currentGesture?.emoji || '❓')}
+              </span>
               <span className="tracking-wider text-[#ffe600]">
-                {currentGesture?.number ? `${currentGesture.emoji} ${currentGesture.number}` : (currentGesture?.label || 'READY')}
+                {lockedPlayerMove !== null && gestureMeta[lockedPlayerMove]
+                  ? `LOCKED: ${lockedPlayerMove}`
+                  : (currentGesture?.number ? `${currentGesture.emoji} ${currentGesture.number}` : (currentGesture?.label || 'READY'))}
               </span>
             </div>
           </div>
@@ -335,7 +349,7 @@ export default function WebcamCard({
           )}
 
           {/* Locked In Move Indicator on Throw */}
-          {lockedPlayerMove !== null && countdown === null && (
+          {lockedPlayerMove !== null && (
             <div className="absolute bottom-3 right-3 z-10 animate-bounce">
               <div className="bg-[#ffe600] text-black font-black text-xs px-3 py-1 rounded-md border-2 border-black shadow-[2px_2px_0px_#000] uppercase">
                 LOCKED: {lockedPlayerMove}

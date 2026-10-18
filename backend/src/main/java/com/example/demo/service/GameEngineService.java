@@ -80,7 +80,9 @@ public class GameEngineService {
             }
 
             room.setPlayerTwoId(p2Id);
+            room.setBatterId(room.getPlayerOneId());
             room.setBowlerId(p2Id);
+            room.setInnings(1);
             room.setCurrentEventType("READY");
             room.setStatusMessage("Player 2 joined! Ready for Toss / First Ball.");
 
@@ -184,16 +186,29 @@ public class GameEngineService {
 
             String p1 = room.getPlayerOneId();
             String p2 = room.getPlayerTwoId();
+
+            // Strict role verification:
+            // 1st Innings: Player 1 (Host) is Batter, Player 2 (Guest) is Bowler
+            // 2nd Innings: Player 2 (Guest) is Batter, Player 1 (Host) is Bowler
+            if (room.getInnings() == 1) {
+                room.setBatterId(p1);
+                room.setBowlerId(p2);
+            } else {
+                room.setBatterId(p2);
+                room.setBowlerId(p1);
+            }
+
             String batterId = room.getBatterId();
             String bowlerId = room.getBowlerId();
 
-            // Default fallback if player didn't send gesture in time
+            // Retrieve moves submitted for each player
             int p1Move = room.getCurrentBallMoves().getOrDefault(p1, random.nextInt(4) + 1);
             int p2Move = room.getCurrentBallMoves().getOrDefault(p2, random.nextInt(4) + 1);
 
             room.setPlayerOneLastMove(p1Move);
             room.setPlayerTwoLastMove(p2Move);
 
+            // Assign exact throws to batterThrow and bowlerThrow
             int batterMove = batterId.equals(p1) ? p1Move : p2Move;
             int bowlerMove = bowlerId.equals(p1) ? p1Move : p2Move;
 
@@ -208,14 +223,14 @@ public class GameEngineService {
                 }
 
                 if (room.getInnings() == 1) {
-                    int firstInningsScore = batterId.equals(p1) ? room.getPlayerOneScore() : room.getPlayerTwoScore();
+                    int firstInningsScore = room.getPlayerOneScore();
                     int target = firstInningsScore + 1;
                     room.setTarget(target);
 
-                    // Swap innings & roles
+                    // Swap innings & roles: Player 2 bats in 2nd Innings, Player 1 bowls
                     room.setInnings(2);
-                    room.setBatterId(bowlerId);
-                    room.setBowlerId(batterId);
+                    room.setBatterId(p2);
+                    room.setBowlerId(p1);
                     room.setCurrentEventType("INNINGS_BREAK");
 
                     String outcomeMsg = String.format("💥 OUT! Both threw %d. Target to chase is %d runs.", batterMove, target);
@@ -275,6 +290,9 @@ public class GameEngineService {
         if (room == null) return;
         synchronized (room) {
             room.resetForNewMatch();
+            room.setInnings(1);
+            room.setBatterId(room.getPlayerOneId());
+            room.setBowlerId(room.getPlayerTwoId());
             broadcastGameState(room, "READY", -1, "Match restarted! Ready for first ball.");
         }
     }
