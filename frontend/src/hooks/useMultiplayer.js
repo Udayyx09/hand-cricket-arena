@@ -6,48 +6,65 @@ const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || 'http://localhost:8080'
 const BACKEND_HTTP = BACKEND_URL;
 const BACKEND_WS = `${BACKEND_URL}/ws-cricket`;
 
+// Google STUN + Free OpenRelay STUN & TURN servers for carrier-grade NAT / 5G / firewall traversal
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:openrelay.metered.ca:80' },
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  }
+];
+
 /**
- * Attaches or replaces tracks in RTCPeerConnection cleanly.
+ * Attaches or replaces tracks in RTCPeerConnection strictly matching media kind.
  * Using replaceTrack ensures streaming begins immediately without renegotiation when transceivers exist.
  */
 function attachTracksToPc(pc, stream) {
   if (!pc || !stream) return;
   const senders = pc.getSenders();
+  const transceivers = pc.getTransceivers ? pc.getTransceivers() : [];
+
   stream.getTracks().forEach((track) => {
-    // 1. Look for existing sender that matches this track's kind
+    // 1. If this exact track instance is already attached to any sender, nothing to do
+    if (senders.some((s) => s.track === track)) return;
+
+    // 2. Look for existing sender of this exact media kind
     const existingSender = senders.find((s) => s.track && s.track.kind === track.kind);
     if (existingSender) {
-      if (existingSender.track !== track) {
-        existingSender.replaceTrack(track).catch((err) => {
-          console.warn(`[WebRTC] replaceTrack error for ${track.kind}:`, err);
-        });
-      }
-    } else {
-      // 2. Look for pre-allocated transceiver sender matching this track kind
-      const transceivers = pc.getTransceivers ? pc.getTransceivers() : [];
-      const matchTransceiver = transceivers.find((t) => {
-        return (t.receiver?.track?.kind === track.kind) || (t.sender && !t.sender.track);
+      existingSender.replaceTrack(track).catch((err) => {
+        console.warn(`[WebRTC] replaceTrack error for ${track.kind}:`, err);
       });
+      return;
+    }
 
-      if (matchTransceiver && matchTransceiver.sender) {
-        matchTransceiver.sender.replaceTrack(track).catch((err) => {
-          console.warn(`[WebRTC] replaceTrack on transceiver error for ${track.kind}:`, err);
-        });
-      } else {
-        // 3. Fallback to empty sender or addTrack
-        const emptySender = senders.find((s) => !s.track);
-        if (emptySender) {
-          emptySender.replaceTrack(track).catch((err) => {
-            console.warn(`[WebRTC] replaceTrack on emptySender error for ${track.kind}:`, err);
-          });
-        } else {
-          try {
-            pc.addTrack(track, stream);
-          } catch (err) {
-            console.warn(`[WebRTC] addTrack fallback error for ${track.kind}:`, err);
-          }
-        }
-      }
+    // 3. Look for pre-allocated transceiver matching this exact media kind ONLY
+    const transceiver = transceivers.find((t) => t.receiver?.track?.kind === track.kind);
+    if (transceiver && transceiver.sender) {
+      transceiver.sender.replaceTrack(track).catch((err) => {
+        console.warn(`[WebRTC] replaceTrack on transceiver error for ${track.kind}:`, err);
+      });
+      return;
+    }
+
+    // 4. Fallback: addTrack
+    try {
+      pc.addTrack(track, stream);
+    } catch (err) {
+      console.warn(`[WebRTC] addTrack fallback error for ${track.kind}:`, err);
     }
   });
 }
@@ -84,22 +101,15 @@ export function useMultiplayer({
   const internalRemoteVideoRef = useRef(null);
   const remoteVideoRef = externalRemoteVideoRef || internalRemoteVideoRef;
 
-  // Initialize or return RTCPeerConnection with pre-allocated transceivers
+  // Initialize or return RTCPeerConnection with STUN + TURN servers and pre-allocated transceivers
   const getOrCreatePeerConnection = useCallback((room, myId) => {
     if (peerConnectionRef.current) return peerConnectionRef.current;
 
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' }
-      ]
+      iceServers: ICE_SERVERS
     });
 
     // Pre-allocate transceivers for both video & audio with 'sendrecv'
-    // This guarantees the initial SDP offer/answer includes m-lines for both media types
     try {
       pc.addTransceiver('video', { direction: 'sendrecv' });
       pc.addTransceiver('audio', { direction: 'sendrecv' });
@@ -114,10 +124,15 @@ export function useMultiplayer({
 
     pc.onicecandidate = (event) => {
       if (event.candidate && room) {
+        const candidateData = event.candidate.toJSON ? event.candidate.toJSON() : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex
+        };
         const payload = {
           senderId: myId,
           type: 'ice-candidate',
-          data: event.candidate
+          data: candidateData
         };
         if (stompClientRef.current?.connected) {
           stompClientRef.current.publish({
@@ -133,24 +148,18 @@ export function useMultiplayer({
     pc.ontrack = (event) => {
       console.log("[WebRTC] ontrack received:", event.track.kind, "id:", event.track.id);
 
-      let incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : null;
+      if (!remoteMediaStreamRef.current) {
+        remoteMediaStreamRef.current = new MediaStream();
+      }
 
-      if (!incomingStream) {
-        if (!remoteMediaStreamRef.current) {
-          remoteMediaStreamRef.current = new MediaStream();
+      // Remove older track of same kind if duplicate
+      remoteMediaStreamRef.current.getTracks().forEach((t) => {
+        if (t.kind === event.track.kind && t.id !== event.track.id) {
+          remoteMediaStreamRef.current.removeTrack(t);
         }
-        // Remove older track of same kind if duplicate
-        remoteMediaStreamRef.current.getTracks().forEach((t) => {
-          if (t.kind === event.track.kind && t.id !== event.track.id) {
-            remoteMediaStreamRef.current.removeTrack(t);
-          }
-        });
-        if (!remoteMediaStreamRef.current.getTracks().some((t) => t.id === event.track.id)) {
-          remoteMediaStreamRef.current.addTrack(event.track);
-        }
-        incomingStream = remoteMediaStreamRef.current;
-      } else {
-        remoteMediaStreamRef.current = incomingStream;
+      });
+      if (!remoteMediaStreamRef.current.getTracks().some((t) => t.id === event.track.id)) {
+        remoteMediaStreamRef.current.addTrack(event.track);
       }
 
       // Handle unmute event (fires when media packets start arriving)
@@ -163,11 +172,13 @@ export function useMultiplayer({
         }
       };
 
-      setRemoteStream(incomingStream);
+      // Pass fresh MediaStream instance wrapper so React detects reference change and re-renders!
+      const freshStream = new MediaStream(remoteMediaStreamRef.current.getTracks());
+      setRemoteStream(freshStream);
 
       if (remoteVideoRef.current) {
-        if (remoteVideoRef.current.srcObject !== incomingStream) {
-          remoteVideoRef.current.srcObject = incomingStream;
+        if (remoteVideoRef.current.srcObject !== remoteMediaStreamRef.current) {
+          remoteVideoRef.current.srcObject = remoteMediaStreamRef.current;
         }
         remoteVideoRef.current.play().catch((err) => {
           console.warn("Remote video auto-play prevented:", err);
@@ -250,6 +261,12 @@ export function useMultiplayer({
             body: JSON.stringify(payload)
           });
         }
+
+        // Request immediate state sync from backend
+        client.publish({
+          destination: `/app/room/${room}/sync`,
+          body: JSON.stringify({})
+        });
 
         // If guest, announce readiness to host
         if (!isRoomHost) {
@@ -442,6 +459,31 @@ export function useMultiplayer({
       myPlayerIdRef.current = data.playerId;
       isHostRef.current = false;
       offerSentRef.current = false;
+
+      // Immediate pre-fetch of room state so Guest gets roles/scores right away
+      try {
+        const stateRes = await fetch(`${BACKEND_HTTP}/api/rooms/${cleanCode}`);
+        if (stateRes.ok) {
+          const roomData = await stateRes.json();
+          setServerState({
+            roomCode: cleanCode,
+            eventType: 'READY',
+            playerOneId: roomData.playerOneId,
+            playerTwoId: roomData.playerTwoId || data.playerId,
+            batterId: roomData.batterId || roomData.playerOneId,
+            bowlerId: roomData.bowlerId || data.playerId,
+            playerOneScore: roomData.playerOneScore || 0,
+            playerTwoScore: roomData.playerTwoScore || 0,
+            innings: roomData.innings || 1,
+            target: roomData.target,
+            playerOneOut: roomData.playerOneOut || false,
+            playerTwoOut: roomData.playerTwoOut || false
+          });
+        }
+      } catch (e) {
+        console.warn("Could not pre-fetch room state:", e);
+      }
+
       connectStomp(cleanCode, data.playerId, false);
       return data;
     } catch (err) {
