@@ -30,19 +30,17 @@ const ICE_SERVERS = [
 ];
 
 /**
- * Attaches or replaces tracks in RTCPeerConnection strictly matching media kind.
- * Using replaceTrack ensures streaming begins immediately without renegotiation when transceivers exist.
+ * Attaches or replaces tracks in RTCPeerConnection cleanly with stream associations.
  */
 function attachTracksToPc(pc, stream) {
   if (!pc || !stream) return;
   const senders = pc.getSenders();
-  const transceivers = pc.getTransceivers ? pc.getTransceivers() : [];
 
   stream.getTracks().forEach((track) => {
     // 1. If this exact track instance is already attached to any sender, nothing to do
     if (senders.some((s) => s.track === track)) return;
 
-    // 2. Look for existing sender of this exact media kind
+    // 2. Look for existing sender of this media kind
     const existingSender = senders.find((s) => s.track && s.track.kind === track.kind);
     if (existingSender) {
       existingSender.replaceTrack(track).catch((err) => {
@@ -51,20 +49,11 @@ function attachTracksToPc(pc, stream) {
       return;
     }
 
-    // 3. Look for pre-allocated transceiver matching this exact media kind ONLY
-    const transceiver = transceivers.find((t) => t.receiver?.track?.kind === track.kind);
-    if (transceiver && transceiver.sender) {
-      transceiver.sender.replaceTrack(track).catch((err) => {
-        console.warn(`[WebRTC] replaceTrack on transceiver error for ${track.kind}:`, err);
-      });
-      return;
-    }
-
-    // 4. Fallback: addTrack
+    // 3. Attach track with full MediaStream association (guarantees a=msid in SDP)
     try {
       pc.addTrack(track, stream);
     } catch (err) {
-      console.warn(`[WebRTC] addTrack fallback error for ${track.kind}:`, err);
+      console.warn(`[WebRTC] addTrack error for ${track.kind}:`, err);
     }
   });
 }
@@ -95,27 +84,19 @@ export function useMultiplayer({
   const remoteMediaStreamRef = useRef(null);
   const iceCandidateQueue = useRef([]);
   const localIceQueue = useRef([]);
-  const offerSentRef = useRef(false);
   const sendOfferRef = useRef(null);
 
   const internalRemoteVideoRef = useRef(null);
   const remoteVideoRef = externalRemoteVideoRef || internalRemoteVideoRef;
 
-  // Initialize or return RTCPeerConnection with STUN + TURN servers and pre-allocated transceivers
+  // Initialize or return RTCPeerConnection with STUN + TURN servers
   const getOrCreatePeerConnection = useCallback((room, myId) => {
     if (peerConnectionRef.current) return peerConnectionRef.current;
 
+    console.log("[WebRTC] Creating RTCPeerConnection for room:", room, "player:", myId);
     const pc = new RTCPeerConnection({
       iceServers: ICE_SERVERS
     });
-
-    // Pre-allocate transceivers for both video & audio with 'sendrecv'
-    try {
-      pc.addTransceiver('video', { direction: 'sendrecv' });
-      pc.addTransceiver('audio', { direction: 'sendrecv' });
-    } catch (e) {
-      console.warn("[WebRTC] addTransceiver warning:", e);
-    }
 
     // Attach local tracks immediately if camera stream is already initialized
     if (localStreamRef.current) {
@@ -146,20 +127,24 @@ export function useMultiplayer({
     };
 
     pc.ontrack = (event) => {
-      console.log("[WebRTC] ontrack received:", event.track.kind, "id:", event.track.id);
+      console.log("[WebRTC] ontrack received:", event.track.kind, "id:", event.track.id, "streams:", event.streams);
+
+      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : null;
 
       if (!remoteMediaStreamRef.current) {
         remoteMediaStreamRef.current = new MediaStream();
       }
 
-      // Remove older track of same kind if duplicate
-      remoteMediaStreamRef.current.getTracks().forEach((t) => {
-        if (t.kind === event.track.kind && t.id !== event.track.id) {
-          remoteMediaStreamRef.current.removeTrack(t);
+      if (incomingStream) {
+        incomingStream.getTracks().forEach((t) => {
+          if (!remoteMediaStreamRef.current.getTracks().some((existing) => existing.id === t.id)) {
+            remoteMediaStreamRef.current.addTrack(t);
+          }
+        });
+      } else {
+        if (!remoteMediaStreamRef.current.getTracks().some((existing) => existing.id === event.track.id)) {
+          remoteMediaStreamRef.current.addTrack(event.track);
         }
-      });
-      if (!remoteMediaStreamRef.current.getTracks().some((t) => t.id === event.track.id)) {
-        remoteMediaStreamRef.current.addTrack(event.track);
       }
 
       // Handle unmute event (fires when media packets start arriving)
@@ -177,9 +162,7 @@ export function useMultiplayer({
       setRemoteStream(freshStream);
 
       if (remoteVideoRef.current) {
-        if (remoteVideoRef.current.srcObject !== remoteMediaStreamRef.current) {
-          remoteVideoRef.current.srcObject = remoteMediaStreamRef.current;
-        }
+        remoteVideoRef.current.srcObject = remoteMediaStreamRef.current;
         remoteVideoRef.current.play().catch((err) => {
           console.warn("Remote video auto-play prevented:", err);
         });
@@ -218,12 +201,6 @@ export function useMultiplayer({
         // Send offer helper
         const sendOffer = async (iceRestart = false) => {
           if (!pc || !client.connected) return;
-
-          // Avoid offer glare/collisions if already in have-local-offer
-          if (pc.signalingState !== 'stable') {
-            console.log("[WebRTC] Signaling state is not stable (" + pc.signalingState + "), waiting for stable");
-            return;
-          }
 
           try {
             if (localStreamRef.current) {
@@ -268,16 +245,24 @@ export function useMultiplayer({
           body: JSON.stringify({})
         });
 
-        // If guest, announce readiness to host
+        // If guest, announce readiness to host with repeat pings to avoid any timing race
         if (!isRoomHost) {
-          client.publish({
-            destination: `/app/room/${room}/signal`,
-            body: JSON.stringify({
-              senderId: playerId,
-              type: 'ready',
-              data: {}
-            })
-          });
+          const announceReady = () => {
+            if (client.connected) {
+              console.log("[WebRTC] Guest announcing ready to Host...");
+              client.publish({
+                destination: `/app/room/${room}/signal`,
+                body: JSON.stringify({
+                  senderId: playerId,
+                  type: 'ready',
+                  data: {}
+                })
+              });
+            }
+          };
+          announceReady();
+          setTimeout(announceReady, 500);
+          setTimeout(announceReady, 1500);
         }
 
         // 1. Subscribe to Game State topic
@@ -285,12 +270,6 @@ export function useMultiplayer({
           try {
             const state = JSON.parse(message.body);
             setServerState(state);
-
-            // Host initiates WebRTC offer when guest joins
-            if (isRoomHost && state.playerTwoId && !offerSentRef.current) {
-              offerSentRef.current = true;
-              sendOffer();
-            }
 
             // Sync countdown and ball resolution events
             if (state.eventType === 'BALL_COUNTDOWN') {
@@ -319,12 +298,25 @@ export function useMultiplayer({
             if (signal.senderId === playerId) return; // Ignore own echoes
 
             if (signal.type === 'ready') {
-              console.log("[WebRTC] Guest announced ready. Initiating offer...");
+              console.log("[WebRTC] Received 'ready' from peer:", signal.senderId, "pc state:", pc.signalingState);
               if (isRoomHost) {
-                sendOffer();
+                if (pc.signalingState === 'have-local-offer' && pc.localDescription) {
+                  // Peer missed previous offer, re-send existing offer
+                  console.log("[WebRTC] Re-sending existing localDescription offer to Guest");
+                  client.publish({
+                    destination: `/app/room/${room}/signal`,
+                    body: JSON.stringify({
+                      senderId: playerId,
+                      type: 'offer',
+                      data: pc.localDescription
+                    })
+                  });
+                } else if (pc.signalingState === 'stable') {
+                  sendOffer();
+                }
               }
             } else if (signal.type === 'offer') {
-              console.log("[WebRTC] Received offer from", signal.senderId);
+              console.log("[WebRTC] Received offer from", signal.senderId, "in state:", pc.signalingState);
               if (localStreamRef.current) {
                 attachTracksToPc(pc, localStreamRef.current);
               }
@@ -362,11 +354,11 @@ export function useMultiplayer({
                 body: JSON.stringify({
                   senderId: playerId,
                   type: 'answer',
-                  data: answer
+                  data: pc.localDescription
                 })
               });
             } else if (signal.type === 'answer') {
-              console.log("[WebRTC] Received answer from", signal.senderId);
+              console.log("[WebRTC] Received answer from", signal.senderId, "in state:", pc.signalingState);
               if (pc.signalingState === 'have-local-offer') {
                 await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
                 while (iceCandidateQueue.current.length > 0) {
@@ -427,7 +419,6 @@ export function useMultiplayer({
       roomCodeRef.current = data.roomCode;
       myPlayerIdRef.current = data.playerId;
       isHostRef.current = true;
-      offerSentRef.current = false;
       connectStomp(data.roomCode, data.playerId, true);
       return data;
     } catch (err) {
@@ -458,7 +449,6 @@ export function useMultiplayer({
       roomCodeRef.current = cleanCode;
       myPlayerIdRef.current = data.playerId;
       isHostRef.current = false;
-      offerSentRef.current = false;
 
       // Immediate pre-fetch of room state so Guest gets roles/scores right away
       try {
@@ -500,8 +490,7 @@ export function useMultiplayer({
     const pc = peerConnectionRef.current;
     if (pc) {
       attachTracksToPc(pc, stream);
-      // If host and already established, send a renegotiation offer if stable
-      if (isHostRef.current && pc.signalingState === 'stable' && offerSentRef.current) {
+      if (isHostRef.current && pc.signalingState === 'stable') {
         sendOfferRef.current?.();
       } else if (!isHostRef.current && stompClientRef.current?.connected && roomCodeRef.current) {
         // If guest, notify host that media stream is active so host can re-offer if needed
@@ -575,7 +564,6 @@ export function useMultiplayer({
     sendOfferRef.current = null;
     setConnectionStatus('DISCONNECTED');
     setErrorMessage(null);
-    offerSentRef.current = false;
     iceCandidateQueue.current = [];
     localIceQueue.current = [];
   };
