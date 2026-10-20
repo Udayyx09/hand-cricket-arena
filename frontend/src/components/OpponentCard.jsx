@@ -22,6 +22,7 @@ export default function OpponentCard({
   const localVideoRef = useRef(null);
   const activeVideoRef = remoteVideoRef || localVideoRef;
   const isSightScreenUp = countdown !== null && countdown > 0;
+  const hasRemoteVideo = !isBot && remoteStream && remoteStream.getVideoTracks().length > 0;
 
   // Attach remote stream to video element
   useEffect(() => {
@@ -46,7 +47,7 @@ export default function OpponentCard({
           </div>
           <div className="flex items-center gap-1.5 bg-black text-[#ff66c4] px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase">
             {isBot ? <Bot size={12} /> : <User size={12} />}
-            <span>{isBot ? 'AI BOT' : (remoteStream ? 'LIVE P2P' : 'FRIEND')}</span>
+            <span>{isBot ? 'AI BOT' : (hasRemoteVideo ? 'LIVE P2P' : 'FRIEND')}</span>
           </div>
         </div>
 
@@ -60,7 +61,7 @@ export default function OpponentCard({
               playsInline
               muted
               className={`absolute inset-0 w-full h-full object-cover scale-x-[-1] transition-opacity duration-300 ${
-                remoteStream ? 'opacity-100 z-10' : 'opacity-0 pointer-events-none'
+                hasRemoteVideo ? 'opacity-100 z-10' : 'opacity-0 pointer-events-none'
               }`}
             />
           )}
@@ -80,7 +81,7 @@ export default function OpponentCard({
           )}
 
           {/* Placeholder card: ONLY shown when waiting for friend's stream, never covers connected video */}
-          {!isBot && !remoteStream && (
+          {!isBot && !hasRemoteVideo && (
             <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-gray-400 bg-[#161616] z-0">
               <Video size={44} className="text-[#ff66c4] mb-2 animate-pulse" />
               <p className="font-black text-xs sm:text-sm text-gray-200 uppercase tracking-wider">

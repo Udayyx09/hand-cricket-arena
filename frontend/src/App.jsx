@@ -16,6 +16,7 @@ export default function App() {
   const [gameMode, setGameMode] = useState('BOT');         // 'BOT' | 'MULTIPLAYER'
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [micEnabled, setMicEnabled] = useState(true);
+  const [localStream, setLocalStream] = useState(null);
   const localStreamRef = useRef(null);
 
   const handleToggleMic = () => {
@@ -169,6 +170,33 @@ export default function App() {
     onMatchOver: handleMultiplayerMatchOver
   });
 
+  // Pre-warm local camera & microphone stream immediately on user interaction
+  const startLocalCamera = async () => {
+    if (localStreamRef.current) return localStreamRef.current;
+    try {
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 640 }, facingMode: 'user' },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+      } catch (audioErr) {
+        console.warn("Microphone access failed, falling back to video only:", audioErr);
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 640 }, facingMode: 'user' },
+          audio: false
+        });
+      }
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+      multiplayer.setLocalStream(stream);
+      return stream;
+    } catch (err) {
+      console.warn("Camera access error:", err);
+      return null;
+    }
+  };
+
   // Auto-transition to Arena when friend connects
   useEffect(() => {
     if (currentView === 'LOBBY' && multiplayer.serverState?.playerTwoId) {
@@ -181,6 +209,8 @@ export default function App() {
   const handleCreateRoom = async () => {
     try {
       setGameMode('MULTIPLAYER');
+      // Pre-warm camera immediately so Host has tracks ready when Guest connects!
+      startLocalCamera();
       await multiplayer.createRoom();
       // Stay in Lobby until friend joins
     } catch (err) {
@@ -191,6 +221,8 @@ export default function App() {
   const handleJoinRoom = async (code) => {
     try {
       setGameMode('MULTIPLAYER');
+      // Pre-warm camera immediately so Guest has tracks ready
+      startLocalCamera();
       await multiplayer.joinRoom(code);
       setCurrentView('ARENA');
       playSound('click', soundEnabledRef.current);
@@ -201,6 +233,7 @@ export default function App() {
 
   const handlePlayVsBot = () => {
     setGameMode('BOT');
+    startLocalCamera();
     resetBotGame();
     setCurrentView('ARENA');
     playSound('click', soundEnabledRef.current);
@@ -447,7 +480,7 @@ export default function App() {
     latestGestureRef.current = 0;
   };
 
-  // Manual Quick Number Override Button
+  // Manual Quick Number Override Buttons
   const handleSelectManualMove = (num) => {
     manualOverrideRef.current = num;
     setManualOverrideMove(num);
@@ -563,8 +596,10 @@ export default function App() {
                 setCurrentGesture={setCurrentGesture}
                 latestGestureRef={latestGestureRef}
                 micEnabled={micEnabled}
+                existingStream={localStream}
                 onStreamReady={(stream) => {
                   localStreamRef.current = stream;
+                  setLocalStream(stream);
                   if (gameMode === 'MULTIPLAYER') {
                     multiplayer.setLocalStream(stream);
                   }

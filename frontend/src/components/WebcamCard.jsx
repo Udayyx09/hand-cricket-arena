@@ -40,7 +40,8 @@ export default function WebcamCard({
   setCurrentGesture,
   latestGestureRef,   // ref to store latest smoothed gesture for 0-latency lock-in
   onStreamReady,      // callback passing local MediaStream for WebRTC
-  micEnabled = true   // microphone state
+  micEnabled = true,  // microphone state
+  existingStream = null // optional pre-initialized MediaStream from App
 }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -80,36 +81,41 @@ export default function WebcamCard({
 
   // Initialize Webcam & Microphone Stream
   useEffect(() => {
-    let stream = null;
+    let internalStream = null;
 
-    async function startCamera() {
+    async function setupCamera() {
       try {
         setCameraError(null);
-        try {
-          // 1. Request both Camera and Microphone with Echo Cancellation
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              width: { ideal: 640 },
-              height: { ideal: 640 },
-              facingMode: 'user'
-            },
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-            }
-          });
-        } catch (audioErr) {
-          console.warn("Microphone access failed or denied, falling back to video only:", audioErr);
-          // 2. Graceful fallback to video only
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              width: { ideal: 640 },
-              height: { ideal: 640 },
-              facingMode: 'user'
-            },
-            audio: false
-          });
+        let stream = existingStream;
+
+        if (!stream) {
+          try {
+            // 1. Request both Camera and Microphone with Echo Cancellation
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                width: { ideal: 640 },
+                height: { ideal: 640 },
+                facingMode: 'user'
+              },
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+              }
+            });
+          } catch (audioErr) {
+            console.warn("Microphone access failed or denied, falling back to video only:", audioErr);
+            // 2. Graceful fallback to video only
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                width: { ideal: 640 },
+                height: { ideal: 640 },
+                facingMode: 'user'
+              },
+              audio: false
+            });
+          }
+          internalStream = stream;
         }
 
         streamRef.current = stream;
@@ -121,13 +127,16 @@ export default function WebcamCard({
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current.play();
+          try {
+            await videoRef.current.play();
             setCameraActive(true);
-            if (onStreamReady) {
-              onStreamReady(stream);
-            }
-          };
+          } catch (e) {
+            console.warn("Local video play error:", e);
+          }
+        }
+
+        if (onStreamReady) {
+          onStreamReady(stream);
         }
       } catch (err) {
         console.warn("Camera access error:", err);
@@ -135,17 +144,18 @@ export default function WebcamCard({
       }
     }
 
-    startCamera();
+    setupCamera();
 
     return () => {
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
+      // Only stop tracks if they were created internally by this component
+      if (internalStream) {
+        internalStream.getTracks().forEach(track => track.stop());
       }
       if (animationFrameId.current) {
         cancelAnimationFrame(animationFrameId.current);
       }
     };
-  }, []);
+  }, [existingStream]);
 
   // Frame detection loop
   useEffect(() => {

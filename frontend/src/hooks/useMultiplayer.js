@@ -6,6 +6,52 @@ const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || 'http://localhost:8080'
 const BACKEND_HTTP = BACKEND_URL;
 const BACKEND_WS = `${BACKEND_URL}/ws-cricket`;
 
+/**
+ * Attaches or replaces tracks in RTCPeerConnection cleanly.
+ * Using replaceTrack ensures streaming begins immediately without renegotiation when transceivers exist.
+ */
+function attachTracksToPc(pc, stream) {
+  if (!pc || !stream) return;
+  const senders = pc.getSenders();
+  stream.getTracks().forEach((track) => {
+    // 1. Look for existing sender that matches this track's kind
+    const existingSender = senders.find((s) => s.track && s.track.kind === track.kind);
+    if (existingSender) {
+      if (existingSender.track !== track) {
+        existingSender.replaceTrack(track).catch((err) => {
+          console.warn(`[WebRTC] replaceTrack error for ${track.kind}:`, err);
+        });
+      }
+    } else {
+      // 2. Look for pre-allocated transceiver sender matching this track kind
+      const transceivers = pc.getTransceivers ? pc.getTransceivers() : [];
+      const matchTransceiver = transceivers.find((t) => {
+        return (t.receiver?.track?.kind === track.kind) || (t.sender && !t.sender.track);
+      });
+
+      if (matchTransceiver && matchTransceiver.sender) {
+        matchTransceiver.sender.replaceTrack(track).catch((err) => {
+          console.warn(`[WebRTC] replaceTrack on transceiver error for ${track.kind}:`, err);
+        });
+      } else {
+        // 3. Fallback to empty sender or addTrack
+        const emptySender = senders.find((s) => !s.track);
+        if (emptySender) {
+          emptySender.replaceTrack(track).catch((err) => {
+            console.warn(`[WebRTC] replaceTrack on emptySender error for ${track.kind}:`, err);
+          });
+        } else {
+          try {
+            pc.addTrack(track, stream);
+          } catch (err) {
+            console.warn(`[WebRTC] addTrack fallback error for ${track.kind}:`, err);
+          }
+        }
+      }
+    }
+  });
+}
+
 export function useMultiplayer({ 
   onCountdownTick, 
   onThrowTrigger, 
@@ -22,31 +68,48 @@ export function useMultiplayer({
   const [connectionStatus, setConnectionStatus] = useState('DISCONNECTED'); // 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR'
   const [errorMessage, setErrorMessage] = useState(null);
 
+  // Synchronous refs to prevent stale closure bugs in callbacks
+  const roomCodeRef = useRef(null);
+  const myPlayerIdRef = useRef(null);
+  const isHostRef = useRef(false);
   const stompClientRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
+  const remoteMediaStreamRef = useRef(null);
   const iceCandidateQueue = useRef([]);
   const localIceQueue = useRef([]);
   const offerSentRef = useRef(false);
+  const sendOfferRef = useRef(null);
+
   const internalRemoteVideoRef = useRef(null);
   const remoteVideoRef = externalRemoteVideoRef || internalRemoteVideoRef;
 
-  // Initialize or return RTCPeerConnection
+  // Initialize or return RTCPeerConnection with pre-allocated transceivers
   const getOrCreatePeerConnection = useCallback((room, myId) => {
     if (peerConnectionRef.current) return peerConnectionRef.current;
 
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
       ]
     });
 
-    // Add local tracks if available
+    // Pre-allocate transceivers for both video & audio with 'sendrecv'
+    // This guarantees the initial SDP offer/answer includes m-lines for both media types
+    try {
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+    } catch (e) {
+      console.warn("[WebRTC] addTransceiver warning:", e);
+    }
+
+    // Attach local tracks immediately if camera stream is already initialized
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
+      attachTracksToPc(pc, localStreamRef.current);
     }
 
     pc.onicecandidate = (event) => {
@@ -68,14 +131,58 @@ export function useMultiplayer({
     };
 
     pc.ontrack = (event) => {
-      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+      console.log("[WebRTC] ontrack received:", event.track.kind, "id:", event.track.id);
+
+      let incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : null;
+
+      if (!incomingStream) {
+        if (!remoteMediaStreamRef.current) {
+          remoteMediaStreamRef.current = new MediaStream();
+        }
+        // Remove older track of same kind if duplicate
+        remoteMediaStreamRef.current.getTracks().forEach((t) => {
+          if (t.kind === event.track.kind && t.id !== event.track.id) {
+            remoteMediaStreamRef.current.removeTrack(t);
+          }
+        });
+        if (!remoteMediaStreamRef.current.getTracks().some((t) => t.id === event.track.id)) {
+          remoteMediaStreamRef.current.addTrack(event.track);
+        }
+        incomingStream = remoteMediaStreamRef.current;
+      } else {
+        remoteMediaStreamRef.current = incomingStream;
+      }
+
+      // Handle unmute event (fires when media packets start arriving)
+      event.track.onunmute = () => {
+        console.log(`[WebRTC] Remote track ${event.track.kind} unmuted`);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.play().catch((err) => {
+            console.warn("Remote video auto-play prevented on track unmute:", err);
+          });
+        }
+      };
+
       setRemoteStream(incomingStream);
 
       if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = (event.streams && event.streams[0]) ? event.streams[0] : incomingStream;
+        if (remoteVideoRef.current.srcObject !== incomingStream) {
+          remoteVideoRef.current.srcObject = incomingStream;
+        }
         remoteVideoRef.current.play().catch((err) => {
           console.warn("Remote video auto-play prevented:", err);
         });
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log("[WebRTC] ICE Connection State:", pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        if (remoteVideoRef.current && remoteVideoRef.current.srcObject) {
+          remoteVideoRef.current.play().catch((err) => {
+            console.warn("Remote video auto-play prevented on ICE connect:", err);
+          });
+        }
       }
     };
 
@@ -98,30 +205,42 @@ export function useMultiplayer({
         const pc = getOrCreatePeerConnection(room, playerId);
 
         // Send offer helper
-        const sendOffer = () => {
+        const sendOffer = async (iceRestart = false) => {
           if (!pc || !client.connected) return;
-          if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach((track) => {
-              const senders = pc.getSenders();
-              if (!senders.some((s) => s.track === track)) {
-                pc.addTrack(track, localStreamRef.current);
-              }
-            });
+
+          // Avoid offer glare/collisions if already in have-local-offer
+          if (pc.signalingState !== 'stable') {
+            console.log("[WebRTC] Signaling state is not stable (" + pc.signalingState + "), waiting for stable");
+            return;
           }
-          pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true })
-            .then((offer) => pc.setLocalDescription(offer))
-            .then(() => {
-              client.publish({
-                destination: `/app/room/${room}/signal`,
-                body: JSON.stringify({
-                  senderId: playerId,
-                  type: 'offer',
-                  data: pc.localDescription
-                })
-              });
-            })
-            .catch((err) => console.warn("Error creating offer:", err));
+
+          try {
+            if (localStreamRef.current) {
+              attachTracksToPc(pc, localStreamRef.current);
+            }
+
+            const offer = await pc.createOffer({
+              offerToReceiveAudio: true,
+              offerToReceiveVideo: true,
+              iceRestart: !!iceRestart
+            });
+            await pc.setLocalDescription(offer);
+
+            console.log("[WebRTC] Publishing offer to /app/room/" + room + "/signal");
+            client.publish({
+              destination: `/app/room/${room}/signal`,
+              body: JSON.stringify({
+                senderId: playerId,
+                type: 'offer',
+                data: pc.localDescription
+              })
+            });
+          } catch (err) {
+            console.warn("[WebRTC] Error creating/sending offer:", err);
+          }
         };
+
+        sendOfferRef.current = sendOffer;
 
         // Flush any queued local ICE candidates
         while (localIceQueue.current.length > 0) {
@@ -138,7 +257,8 @@ export function useMultiplayer({
             destination: `/app/room/${room}/signal`,
             body: JSON.stringify({
               senderId: playerId,
-              type: 'ready'
+              type: 'ready',
+              data: {}
             })
           });
         }
@@ -182,19 +302,28 @@ export function useMultiplayer({
             if (signal.senderId === playerId) return; // Ignore own echoes
 
             if (signal.type === 'ready') {
+              console.log("[WebRTC] Guest announced ready. Initiating offer...");
               if (isRoomHost) {
                 sendOffer();
               }
             } else if (signal.type === 'offer') {
+              console.log("[WebRTC] Received offer from", signal.senderId);
               if (localStreamRef.current) {
-                localStreamRef.current.getTracks().forEach((track) => {
-                  const senders = pc.getSenders();
-                  if (!senders.some((s) => s.track === track)) {
-                    pc.addTrack(track, localStreamRef.current);
-                  }
-                });
+                attachTracksToPc(pc, localStreamRef.current);
               }
-              await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+
+              // Handle glare/collision gracefully
+              if (pc.signalingState !== 'stable') {
+                console.log("[WebRTC] Resolving offer collision in state:", pc.signalingState);
+                await Promise.all([
+                  pc.setLocalDescription({ type: 'rollback' }).catch(() => {}),
+                  pc.setRemoteDescription(new RTCSessionDescription(signal.data))
+                ]);
+              } else {
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+              }
+
+              // Drain queued ICE candidates
               while (iceCandidateQueue.current.length > 0) {
                 const queued = iceCandidateQueue.current.shift();
                 try {
@@ -203,8 +332,14 @@ export function useMultiplayer({
                   console.warn("Error adding queued ICE candidate:", e);
                 }
               }
-              const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+
+              const answer = await pc.createAnswer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+              });
               await pc.setLocalDescription(answer);
+
+              console.log("[WebRTC] Publishing answer to /app/room/" + room + "/signal");
               client.publish({
                 destination: `/app/room/${room}/signal`,
                 body: JSON.stringify({
@@ -214,25 +349,32 @@ export function useMultiplayer({
                 })
               });
             } else if (signal.type === 'answer') {
-              await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
-              while (iceCandidateQueue.current.length > 0) {
-                const queued = iceCandidateQueue.current.shift();
-                try {
-                  await pc.addIceCandidate(queued);
-                } catch (e) {
-                  console.warn("Error adding queued ICE candidate:", e);
+              console.log("[WebRTC] Received answer from", signal.senderId);
+              if (pc.signalingState === 'have-local-offer') {
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+                while (iceCandidateQueue.current.length > 0) {
+                  const queued = iceCandidateQueue.current.shift();
+                  try {
+                    await pc.addIceCandidate(queued);
+                  } catch (e) {
+                    console.warn("Error adding queued ICE candidate:", e);
+                  }
                 }
+              } else {
+                console.warn("[WebRTC] Answer received but signalingState is", pc.signalingState);
               }
             } else if (signal.type === 'ice-candidate') {
-              try {
-                const candidate = new RTCIceCandidate(signal.data);
-                if (pc.remoteDescription && pc.remoteDescription.type) {
-                  await pc.addIceCandidate(candidate);
-                } else {
-                  iceCandidateQueue.current.push(candidate);
+              if (signal.data && (signal.data.candidate || signal.data.sdpMid !== undefined)) {
+                try {
+                  const candidate = new RTCIceCandidate(signal.data);
+                  if (pc.remoteDescription && pc.remoteDescription.type) {
+                    await pc.addIceCandidate(candidate);
+                  } else {
+                    iceCandidateQueue.current.push(candidate);
+                  }
+                } catch (err) {
+                  console.warn("Error adding ICE candidate:", err);
                 }
-              } catch (err) {
-                console.warn("Error adding ICE candidate:", err);
               }
             }
           } catch (e) {
@@ -265,6 +407,9 @@ export function useMultiplayer({
       setRoomCode(data.roomCode);
       setMyPlayerId(data.playerId);
       setIsHost(true);
+      roomCodeRef.current = data.roomCode;
+      myPlayerIdRef.current = data.playerId;
+      isHostRef.current = true;
       offerSentRef.current = false;
       connectStomp(data.roomCode, data.playerId, true);
       return data;
@@ -293,6 +438,9 @@ export function useMultiplayer({
       setRoomCode(cleanCode);
       setMyPlayerId(data.playerId);
       setIsHost(false);
+      roomCodeRef.current = cleanCode;
+      myPlayerIdRef.current = data.playerId;
+      isHostRef.current = false;
       offerSentRef.current = false;
       connectStomp(cleanCode, data.playerId, false);
       return data;
@@ -304,25 +452,34 @@ export function useMultiplayer({
     }
   };
 
-  // Save local camera stream
+  // Save local camera stream & update active RTCPeerConnection immediately
   const setLocalStream = (stream) => {
     localStreamRef.current = stream;
-    if (peerConnectionRef.current) {
-      stream.getTracks().forEach((track) => {
-        const senders = peerConnectionRef.current.getSenders();
-        const hasTrack = senders.some((s) => s.track === track);
-        if (!hasTrack) {
-          peerConnectionRef.current.addTrack(track, stream);
-        }
-      });
+    const pc = peerConnectionRef.current;
+    if (pc) {
+      attachTracksToPc(pc, stream);
+      // If host and already established, send a renegotiation offer if stable
+      if (isHostRef.current && pc.signalingState === 'stable' && offerSentRef.current) {
+        sendOfferRef.current?.();
+      } else if (!isHostRef.current && stompClientRef.current?.connected && roomCodeRef.current) {
+        // If guest, notify host that media stream is active so host can re-offer if needed
+        stompClientRef.current.publish({
+          destination: `/app/room/${roomCodeRef.current}/signal`,
+          body: JSON.stringify({
+            senderId: myPlayerIdRef.current,
+            type: 'ready',
+            data: {}
+          })
+        });
+      }
     }
   };
 
   // Trigger synchronized ball countdown
   const startBall = () => {
-    if (stompClientRef.current?.connected && roomCode) {
+    if (stompClientRef.current?.connected && roomCodeRef.current) {
       stompClientRef.current.publish({
-        destination: `/app/room/${roomCode}/start-ball`,
+        destination: `/app/room/${roomCodeRef.current}/start-ball`,
         body: JSON.stringify({})
       });
     }
@@ -330,11 +487,11 @@ export function useMultiplayer({
 
   // Submit player throw move (1 to 6)
   const submitMove = (move) => {
-    if (stompClientRef.current?.connected && roomCode && myPlayerId) {
+    if (stompClientRef.current?.connected && roomCodeRef.current && myPlayerIdRef.current) {
       stompClientRef.current.publish({
-        destination: `/app/room/${roomCode}/move`,
+        destination: `/app/room/${roomCodeRef.current}/move`,
         body: JSON.stringify({
-          playerId: myPlayerId,
+          playerId: myPlayerIdRef.current,
           move: Number(move)
         })
       });
@@ -343,9 +500,9 @@ export function useMultiplayer({
 
   // Reset match for rematch
   const resetMatch = () => {
-    if (stompClientRef.current?.connected && roomCode) {
+    if (stompClientRef.current?.connected && roomCodeRef.current) {
       stompClientRef.current.publish({
-        destination: `/app/room/${roomCode}/reset`,
+        destination: `/app/room/${roomCodeRef.current}/reset`,
         body: JSON.stringify({})
       });
     }
@@ -364,11 +521,16 @@ export function useMultiplayer({
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
+    remoteMediaStreamRef.current = null;
     setRemoteStream(null);
     setServerState(null);
     setRoomCode(null);
     setMyPlayerId(null);
     setIsHost(false);
+    roomCodeRef.current = null;
+    myPlayerIdRef.current = null;
+    isHostRef.current = false;
+    sendOfferRef.current = null;
     setConnectionStatus('DISCONNECTED');
     setErrorMessage(null);
     offerSentRef.current = false;
